@@ -11,7 +11,8 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import sys
 import  numpy as np
 np.random.seed(2312)
-from scipy import fftpack
+import skimage as ski
+from scipy.ndimage import rotate
 from matplotlib import pyplot as plt
 plt.style.use('dark_background')
 
@@ -31,16 +32,16 @@ def inv_dynamic_range(synth_img, eps=1e-6, mult_factor=1):
 
 def _create_circular_mask(h, w, radius=None, center=None):
 
-        if center is None: # use the middle of the image
-                center = (int(w/2), int(h/2))
-        if radius is None: # use the smallest distance between the center and image walls
-                radius = min(center[0], center[1], w-center[0], h-center[1])
+    if center is None: # use the middle of the image
+        center = (int(w/2), int(h/2))
+    if radius is None: # use the smallest distance between the center and image walls
+        radius = min(center[0], center[1], w-center[0], h-center[1])
 
-        Y, X = np.ogrid[:h, :w]
-        dist_from_center = np.sqrt((X - center[0])**2 + (Y-center[1])**2)
+    Y, X = np.ogrid[:h, :w]
+    dist_from_center = np.sqrt((X - center[0])**2 + (Y-center[1])**2)
 
-        mask = dist_from_center <= radius
-        return mask
+    mask = dist_from_center <= radius
+    return mask
 
 ### ----------------------------------------- ###
 #|                                             |#
@@ -142,6 +143,16 @@ def g16_Y_cyl(m500, z, A = -4.697, B = 1.65, C = 0.45):
     c = (cosmo.efunc(z) / cosmo.efunc(0.6))**C
     return a*b*c
 
+def new_rescaling(
+        gan_map:np.ndarray,
+        mass:float
+        ) -> np.ndarray:
+    Dian_sim_fit = lambda m: -13.2 + 0.79*(m)
+    ref_value = 10**Dian_sim_fit(mass)
+    initial_value = np.sum(gan_map)
+
+    return gan_map * (ref_value / initial_value)
+
 ### ----------------------------------------- ###
 #|                                             |#
 #|          GAN MODEL INITIALIZATION           |#
@@ -188,18 +199,12 @@ def generate_image(
     return np.squeeze(inv_dynamic_range(image, mult_factor=2.5))
 
 def Fourier_transform(
-        image:np.ndarray, out:str = 'mod_phi'
+        image:np.ndarray
         ) -> tuple[np.ndarray, np.ndarray]:
-    '''
-    This function simply applies fftpack.fft2 and returns module and phase
-    (or real and imaginary part if specified).
-    image: np.ndarray over which applying the fft
-    out: str that the definies the type of output (default mod and phase, available also 're_im')
-    '''
-    image_fft = np.fft.fftshift(fftpack.fft2(image))
-    if out == 'mod_phi': return np.absolute(image_fft), np.angle(image_fft)
-    elif out == 're_im': return np.real(image_fft), np.imag(image_fft)
-    else: sys.exit("Unrecongnized Fourier type output")
+    '''This function simply applies np.fft.rfft2 and returns real and imaginary part.'''
+    image_fft = np.fft.rfft2(image)
+
+    return np.real(image_fft), np.imag(image_fft)
 
 ### ----------------------------------------- ###
 #|                                             |#
@@ -212,12 +217,17 @@ def Fourier_transform(
 END_SIZE, latent_dim, redshift = 128, 6, 0.03
 # # # # # #
 
-
 # Costruzione del target
-sample_id = 'tSZ_sim=D8_snap=088_mass=14.49_reds=0.03_ax=z_rot=0.npy'
+sample_id = 'TNG_Halo_15916351.npy'
 sample_img = np.load(sample_id)
-resize_factor = sample_img.shape[0] // END_SIZE
-target = sample_img[::resize_factor, ::resize_factor]
+target = ski.transform.resize(sample_img[:, :, 0], (END_SIZE, END_SIZE))
+# target = rotate(target, 30, reshape=False)
+target = 10**target     # TNG maps are in log10 scale
+
+sigma = 5e-4
+real_target, imag_target = Fourier_transform(target)
+real_target += np.random.normal(0, sigma, real_target.shape)
+imag_target += np.random.normal(0, sigma, imag_target.shape)
 
 xgan = build_gan(END_SIZE=END_SIZE, noise_dim=latent_dim, ckp_path="pgan_0990.weights.h5")
 '''
@@ -228,8 +238,8 @@ target_map = rescale(SZ_map(target, redshift=redshift, m500=fixed_mass), model='
 
 '''
 # Test in image space
-sigma = 5e-6
-noisy_obs = target + np.random.normal(0, sigma, target.shape)
+# sigma = 5e-6
+# noisy_obs = target + np.random.normal(0, sigma, target.shape)
 
 ### ----------------------------------------- ###
 #|                                             |#
@@ -244,13 +254,11 @@ from scipy.stats import norm, uniform
 def modello(theta, gan_model):
     # TODO: redshift value inserted by hand, not very flexible
     latent, mass = theta[:6], theta[6]
-    # mass = theta
-    # latent = np.random.normal(0, 1, 6)
     sample = generate_image(mass=mass, model=gan_model, latent_vector=latent)
-    sample_map = rescale(SZ_map(input_image=sample, redshift=0.03, m500=mass), model='dianoga_fit')
-    # sample_module, sample_phase = Fourier_transform(sample_map, out='re_im')
-    sample_rfft = np.fft.rfft2(sample_map)
-    return sample_rfft.real, sample_rfft.imag# sample_module, sample_phase
+    # sample_map = rescale(SZ_map(input_image=sample, redshift=0.03, m500=mass), model='dianoga_fit')
+    sample_map = new_rescaling(gan_map=sample, mass=mass)
+    model_real, model_imag = Fourier_transform(sample_map)
+    return model_real, model_imag
 
 def modello_image_space(theta, gan_model):
     latent, mass = theta[:6], theta[6]
@@ -261,12 +269,12 @@ def modello_image_space(theta, gan_model):
 
 ## Implementation for nautilus
 prior = Prior()
-prior.add_parameter(r'$\theta_1$', dist=(-3, 3))
-prior.add_parameter(r'$\theta_2$', dist=(-3, 3))
-prior.add_parameter(r'$\theta_3$', dist=(-3, 3))
-prior.add_parameter(r'$\theta_4$', dist=(-3, 3))
-prior.add_parameter(r'$\theta_5$', dist=(-3, 3))
-prior.add_parameter(r'$\theta_6$', dist=(-3, 3))
+prior.add_parameter(r'$\theta_1$', dist=(-3.2, 3.2))
+prior.add_parameter(r'$\theta_2$', dist=(-3.2, 3.2))
+prior.add_parameter(r'$\theta_3$', dist=(-3.2, 3.2))
+prior.add_parameter(r'$\theta_4$', dist=(-3.2, 3.2))
+prior.add_parameter(r'$\theta_5$', dist=(-3.2, 3.2))
+prior.add_parameter(r'$\theta_6$', dist=(-3.2, 3.2))
 prior.add_parameter('logM500', dist=(13.5, 15.5))
 
 def nautilus_likelihood(param_dict):
@@ -274,11 +282,14 @@ def nautilus_likelihood(param_dict):
               param_dict[r'$\theta_4$'], param_dict[r'$\theta_5$'], param_dict[r'$\theta_6$']]
     mass = param_dict['logM500']
 
-    image_from_model = modello_image_space(latent + [mass], xgan)
-    logL_image_space = np.nansum(norm.logpdf(noisy_obs, loc=image_from_model, scale=sigma))
+    # image_from_model = modello_image_space(latent + [mass], xgan)
+    # logL_image_space = np.nansum(norm.logpdf(noisy_obs, loc=image_from_model, scale=sigma))
+    real_from_model, imag_from_model = modello(latent + [mass], xgan)
+    logL_real = np.nansum(norm.logpdf(real_target, loc=real_from_model, scale=sigma))
+    logL_imag = np.nansum(norm.logpdf(imag_target, loc=imag_from_model, scale=sigma))
 
-    return logL_image_space
-
+    return logL_real + logL_imag
+'''
 def log_prior(theta):
     params, mass = theta[:6], theta[6]
     # mass = theta
@@ -317,6 +328,7 @@ def log_posterior(theta):
     if not np.isfinite(lp):
         return -np.inf
     return lp + log_likelihood(theta, xgan)
+'''
 
 ### ----------------------------------------- ###
 #|                                             |#
@@ -343,11 +355,11 @@ if __name__ == "__main__":
     sampler.run_mcmc(pos, n_steps, progress=True)
 
     '''
-    ckpt_file = 'naut_ckpt_sim_image.h5'
+    ckpt_file = 'TNG_Halo_15916351_0.h5'
 
     n_proc = 4
     sampler = Sampler(prior, nautilus_likelihood, pool=MPIPoolExecutor(max_workers=n_proc), filepath=ckpt_file)
-    sampler.run(verbose=True, timeout=4.7e3)
+    sampler.run(verbose=True, timeout=3.6e3)
 
     '''
     points, log_w, log_l = sampler.posterior()
