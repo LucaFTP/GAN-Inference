@@ -1,12 +1,35 @@
-import os
-os.environ["OMP_NUM_THREADS"] = '1'
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-
+import json
 import  numpy as np
 np.random.seed(2312)
 from model import PGAN
 import tensorflow as tf
+from typing import Callable
+from argparse import ArgumentParser
+
+config_filepath = 'config.json'
+with open(config_filepath, "r") as f:
+    config_file = json.load(f)
+
+train_config = config_file.get('train_config')
+model_config = config_file.get('model_config')
+
+def parser(
+    prog_name: str, dscr: str, get_args: Callable[[ArgumentParser], ArgumentParser]
+) -> Callable[[Callable], Callable]:
+    def decorator(function):
+        def new_function(*args, **kwargs):
+            prs = ArgumentParser(
+                prog=prog_name,
+                description=dscr,
+            )
+
+            prs = get_args(prs)
+            args = prs.parse_args()
+            function(args)
+
+        return new_function
+
+    return decorator
 
 ### ----------------------------------------- ###
 #|                                             |#
@@ -14,13 +37,13 @@ import tensorflow as tf
 #|                                             |#
 ### ----------------------------------------- ###
 
-def dynamic_range_opt(array, epsilon=1e-6, mult_factor=1):
+def dynamic_range_opt(array, epsilon=train_config['epsilon'], mult_factor=train_config['mult_factor']):
     array = (array + epsilon)/epsilon
     a = np.log10(array)
     b = np.log10(1/epsilon)
     return a/b * mult_factor
 
-def inv_dynamic_range(synth_img, eps=1e-6, mult_factor=1):
+def inv_dynamic_range(synth_img, eps=train_config['epsilon'], mult_factor=train_config['mult_factor']):
     image = np.asarray(synth_img)/mult_factor
     a = - eps**(1 - image)
     b = eps**image - 1
@@ -44,7 +67,7 @@ def generate_image(
     random_latent_vectors = tf.convert_to_tensor(np.expand_dims(latent_vector, 0), dtype=tf.float32)
     image = model.generator([random_latent_vectors, mass_tensor])
     
-    return np.squeeze(inv_dynamic_range(image, mult_factor=2.5))
+    return np.squeeze(inv_dynamic_range(image))
 
 def Fourier_transform(
         image:np.ndarray
@@ -61,23 +84,22 @@ def Fourier_transform(
 ### ----------------------------------------- ###
 
 def build_gan(
-        END_SIZE:int, noise_dim:int, ckp_path:str
+        ckpt_path:str
         ) -> PGAN:
     
-    xgan = PGAN(latent_dim = noise_dim)
-
-    for n_depth in range(1, int(np.log2(END_SIZE/2))):
+    end_size = train_config['end_size']
+    xgan = PGAN(pgan_config=model_config, version=config_file['version'])
+    for n_depth in range(1, int(np.log2(end_size/2))):
         xgan.n_depth = n_depth
+
         xgan.fade_in_generator()
         xgan.fade_in_discriminator()
-        xgan.fade_in_regressor()
-        
-        xgan.stabilize_discriminator()
-        xgan.stabilize_generator()
-        xgan.stabilize_regressor()
 
-    xgan.build(input_shape=(END_SIZE, END_SIZE))
-    xgan.load_weights(ckp_path)    
+        xgan.stabilize_generator()
+        xgan.stabilize_discriminator()
+
+    xgan.build(input_shape=(end_size, end_size))
+    xgan.load_weights(ckpt_path)
     
     return xgan
 
@@ -152,3 +174,7 @@ def modifica_diagonale(matrix, row, col):
             new_col = col + y
             if 0 <= new_row < matrix.shape[0] and 0 <= new_col < matrix.shape[1]:
                 matrix[new_row][new_col] = 1
+
+if __name__ == "__main__":
+    xgan = build_gan(ckpt_path="pgan_5_init_0855.weights.h5")
+    print("GAN model built successfully.")
